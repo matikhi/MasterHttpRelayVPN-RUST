@@ -62,32 +62,6 @@ const DECOY_HTML =
   '<body><p>The script completed but did not return anything.</p>' +
   '</body></html>';
 
-// ── Request Handlers ────────────────────────────────────────
-
-function _decoyOrError (jsonBody) {
-  if (DIAGNOSTIC_MODE) return _json(jsonBody);
-  return ContentService
-    .createTextOutput(DECOY_HTML)
-    .setMimeType(ContentService.MimeType.XML);
-}
-
-function doPost (e) {
-  try {
-    let req = JSON.parse(e.postData.contents);
-    if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
-
-    // Batch mode: { k, q: [...] }
-    if (Array.isArray(req.q)) return _doBatch(req.q);
-
-    // Single mode
-    return _doSingle(req);
-  } catch (err) {
-    // Parse failures of the request body are also probe-shaped — a real
-    // mhrv-rs client never sends invalid JSON. Decoy for the same reason.
-    return _decoyOrError({ e: String(err) });
-  }
-}
-
 // `doGet` is what active scanners hit first (HTTP GET probes are cheaper
 // than POSTs). Apps Script defaults to a "Script function not found" page
 // here which is a fine-enough decoy on its own, but explicitly returning
@@ -99,7 +73,51 @@ function doGet (e) {
     .setMimeType(ContentService.MimeType.XML);
 }
 
-// ── Single Request ─────────────────────────────────────────
+function _json (obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
+    ContentService.MimeType.JSON
+  );
+}
+
+function _decoyOrError (jsonBody) {
+  if (DIAGNOSTIC_MODE) return _json(jsonBody);
+  return ContentService
+    .createTextOutput(DECOY_HTML)
+    .setMimeType(ContentService.MimeType.XML);
+}
+
+function _respHeaders (resp) {
+  try {
+    if (typeof resp.getAllHeaders === "function") {
+      return resp.getAllHeaders();
+    }
+  } catch (err) { }
+  return resp.getHeaders();
+}
+
+function _buildOpts (req) {
+  let opts = {
+    method: (req.m || "GET").toLowerCase(),
+    muteHttpExceptions: true,
+    followRedirects: true,          // ← always true; r flag now has different meaning
+    validateHttpsCertificates: true,
+    escaping: false,
+  };
+  if (req.h && typeof req.h === "object") {
+    let headers = {};
+    for (let k in req.h) {
+      if (req.h.hasOwnProperty(k) && !SKIP_HEADERS[ k.toLowerCase() ]) {
+        headers[ k ] = req.h[ k ];
+      }
+    }
+    opts.headers = headers;
+  }
+  if (req.b) {
+    opts.payload = Utilities.base64Decode(req.b);
+    if (req.ct) opts.contentType = req.ct;
+  }
+  return opts;
+}
 
 function _doSingle (req) {
   if (!req.u || typeof req.u !== "string" || !req.u.match(/^https?:\/\//i)) {
@@ -147,8 +165,6 @@ function _doSingle (req) {
     return _json({ e: "fetch failed: " + String(err) });
   }
 }
-
-// ── Batch Request ──────────────────────────────────────────
 
 function _doBatch (items) {
   let fetchArgs = [];
@@ -237,43 +253,19 @@ function _doBatch (items) {
   return _json({ q: results });
 }
 
-// ── Request Building ───────────────────────────────────────
-
-function _buildOpts (req) {
-  let opts = {
-    method: (req.m || "GET").toLowerCase(),
-    muteHttpExceptions: true,
-    followRedirects: true,          // ← always true; r flag now has different meaning
-    validateHttpsCertificates: true,
-    escaping: false,
-  };
-  if (req.h && typeof req.h === "object") {
-    let headers = {};
-    for (let k in req.h) {
-      if (req.h.hasOwnProperty(k) && !SKIP_HEADERS[ k.toLowerCase() ]) {
-        headers[ k ] = req.h[ k ];
-      }
-    }
-    opts.headers = headers;
-  }
-  if (req.b) {
-    opts.payload = Utilities.base64Decode(req.b);
-    if (req.ct) opts.contentType = req.ct;
-  }
-  return opts;
-}
-
-function _respHeaders (resp) {
+function doPost (e) {
   try {
-    if (typeof resp.getAllHeaders === "function") {
-      return resp.getAllHeaders();
-    }
-  } catch (err) { }
-  return resp.getHeaders();
-}
+    let req = JSON.parse(e.postData.contents);
+    if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
 
-function _json (obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
-    ContentService.MimeType.JSON
-  );
+    // Batch mode: { k, q: [...] }
+    if (Array.isArray(req.q)) return _doBatch(req.q);
+
+    // Single mode
+    return _doSingle(req);
+  } catch (err) {
+    // Parse failures of the request body are also probe-shaped — a real
+    // mhrv-rs client never sends invalid JSON. Decoy for the same reason.
+    return _decoyOrError({ e: String(err) });
+  }
 }
