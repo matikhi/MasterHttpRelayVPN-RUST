@@ -40,19 +40,19 @@ const DIAGNOSTIC_MODE = false;
 // misconfigured upstream proxy on the user side can't leak the user's
 // real IP through the relay path. Mirrors upstream
 // `masterking32/MasterHttpRelayVPN@3094288`.
-const SKIP_HEADERS = {
-  host: 1, connection: 1, "content-length": 1,
-  "transfer-encoding": 1, "proxy-connection": 1, "proxy-authorization": 1,
-  "priority": 1, te: 1,
-  "x-forwarded-for": 1, "x-forwarded-host": 1, "x-forwarded-proto": 1,
-  "x-forwarded-port": 1, "x-real-ip": 1, "forwarded": 1, "via": 1,
-};
-
+const SKIP_HEADERS = new Set([
+  "host", "connection", "content-length",
+  "transfer-encoding", "proxy-connection", "proxy-authorization",
+  "priority", "te",
+  "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+  "x-forwarded-port", "x-real-ip", "forwarded", "via",
+]);
+const VALID_METHODS = new Set([ "get", "post", "put", "delete", "patch", "head", "options" ]);
 // Methods we consider safe to replay if `UrlFetchApp.fetchAll()` raises.
 // GET/HEAD/OPTIONS are idempotent per RFC 9110; POST/PUT/PATCH/DELETE
 // can have side-effects so we surface the error instead of silently
 // re-firing them.
-const SAFE_REPLAY_METHODS = { GET: 1, HEAD: 1, OPTIONS: 1 };
+const SAFE_REPLAY_METHODS = new Set([ "get", "head", "options" ]);
 
 // HTML body for the bad-auth decoy. Mimics a minimal Apps Script-style
 // placeholder page — no proxy-shaped JSON, nothing distinctive enough
@@ -61,6 +61,8 @@ const DECOY_HTML =
   '<!DOCTYPE html><html><head><title>Web App</title></head>' +
   '<body><p>The script completed but did not return anything.</p>' +
   '</body></html>';
+
+const URL_PATTERN = /^https?:\/\//i;
 
 // `doGet` is what active scanners hit first (HTTP GET probes are cheaper
 // than POSTs). Apps Script defaults to a "Script function not found" page
@@ -87,30 +89,21 @@ function _decoyOrError (jsonBody) {
 }
 
 function _respHeaders (resp) {
-  try {
-    if (typeof resp.getAllHeaders === "function") {
-      return resp.getAllHeaders();
-    }
-  } catch (err) { }
-  return resp.getHeaders();
+  return resp.getAllHeaders?.() ?? resp.getHeaders();
 }
 
 function _buildOpts (req) {
   let opts = {
-    method: (req.m || "GET").toLowerCase(),
+    method: (req.m?.toLowerCase?.() ?? "get"),
     muteHttpExceptions: true,
     followRedirects: true,          // ← always true; r flag now has different meaning
     validateHttpsCertificates: true,
     escaping: false,
   };
+
   if (req.h && typeof req.h === "object") {
-    let headers = {};
-    for (let k in req.h) {
-      if (req.h.hasOwnProperty(k) && !SKIP_HEADERS[ k.toLowerCase() ]) {
-        headers[ k ] = req.h[ k ];
-      }
-    }
-    opts.headers = headers;
+    opts.headers = Object.fromEntries(
+      Object.entries(req.h).filter(([ k ]) => !SKIP_HEADERS.has(k.toLowerCase())));
   }
   if (req.b) {
     opts.payload = Utilities.base64Decode(req.b);
@@ -120,7 +113,7 @@ function _buildOpts (req) {
 }
 
 function _doSingle (req) {
-  if (!req.u || typeof req.u !== "string" || !req.u.match(/^https?:\/\//i)) {
+  if (!req.u || typeof req.u !== "string" || !URL_PATTERN.test(req.u)) {
     return _json({ e: "bad url" });
   }
 
@@ -155,7 +148,6 @@ function _doSingle (req) {
       }
     }
 
-
     return _json({
       s: resp.getResponseCode(),
       h: _respHeaders(resp),
@@ -167,29 +159,27 @@ function _doSingle (req) {
 }
 
 function _doBatch (items) {
-  let fetchArgs = [];
-  let fetchIndex = [];
+  let fetchItems = [];
+  let fetchIndices = [];
   let fetchMethods = [];
-  let errorMap = {};
+  let errorMap = new Map();
 
   for (let i = 0; i < items.length; i++) {
     let item = items[ i ];
     if (!item || typeof item !== "object") {
-      errorMap[ i ] = "bad item";
+      errorMap.set(i, "bad item");
       continue;
     }
-    if (!item.u || typeof item.u !== "string" || !item.u.match(/^https?:\/\//i)) {
-      errorMap[ i ] = "bad url";
+    if (!item.u || typeof item.u !== "string" || !URL_PATTERN.test(item.u)) {
+      errorMap.set(i, "bad url");
       continue;
     }
     try {
-      let opts = _buildOpts(item);
-      opts.url = item.u;
-      fetchArgs.push(opts);
-      fetchIndex.push(i);
-      fetchMethods.push(String(item.m || "GET").toUpperCase());
+      fetchItems.push({ url: item.u, ..._buildOpts(item) });
+      fetchIndices.push(i);
+      fetchMethods.push((item.m?.toLowerCase?.() ?? "get"));
     } catch (buildErr) {
-      errorMap[ i ] = String(buildErr);
+      errorMap.set(i, String(buildErr));
     }
   }
 
@@ -199,49 +189,43 @@ function _doBatch (items) {
   // so a single bad request does not zero out every response in the
   // batch. Mirrors upstream `masterking32/MasterHttpRelayVPN@3094288`.
   let responses = [];
-  if (fetchArgs.length > 0) {
-    try {
-      responses = UrlFetchApp.fetchAll(fetchArgs);
-    } catch (fetchAllErr) {
-      responses = [];
-      for (let j = 0; j < fetchArgs.length; j++) {
-        try {
-          if (!SAFE_REPLAY_METHODS[ fetchMethods[ j ] ]) {
-            errorMap[ fetchIndex[ j ] ] =
-              "batch fetchAll failed; unsafe method not replayed";
-            responses[ j ] = null;
-            continue;
-          }
-          let fallbackReq = fetchArgs[ j ];
-          let fallbackUrl = fallbackReq.url;
-          let fallbackOpts = {};
-          for (let key in fallbackReq) {
-            if (
-              Object.prototype.hasOwnProperty.call(fallbackReq, key) &&
-              key !== "url"
-            ) {
-              fallbackOpts[ key ] = fallbackReq[ key ];
-            }
-          }
-          responses[ j ] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
-        } catch (singleErr) {
-          errorMap[ fetchIndex[ j ] ] = String(singleErr);
+  try {
+    // Single - chunk fast path; avoids the fetchAll overhead for the common case.
+    if (fetchItems.length === 1) {
+      responses = [ UrlFetchApp.fetch(fetchItems[ 0 ].url, fetchItems[ 0 ]) ];
+    } else {
+      responses = UrlFetchApp.fetchAll(fetchItems);
+    }
+  } catch (fetchAllErr) {
+    const fetchAllErrMsg = String(fetchAllErr);
+    responses = [];
+    for (let j = 0; j < fetchItems.length; j++) {
+      try {
+        if (!SAFE_REPLAY_METHODS.has(fetchMethods[ j ])) {
+          errorMap.set(fetchIndices[ j ], "batch fetchAll failed; unsafe method not replayed");
           responses[ j ] = null;
+          continue;
         }
+        let fallbackReq = fetchItems[ j ];
+        responses[ j ] = UrlFetchApp.fetch(fallbackReq.url, fallbackReq);
+      } catch (singleErr) {
+        const singleErrMsg = String(singleErr);
+        errorMap.set(fetchIndices[ j ], singleErrMsg);
+        responses[ j ] = null;
       }
     }
   }
 
   let results = [];
-  let rIdx = 0;
   for (let i = 0; i < items.length; i++) {
-    if (Object.prototype.hasOwnProperty.call(errorMap, i)) {
-      results.push({ e: errorMap[ i ] });
+    if (errorMap.has(i)) {
+      results.push({ e: String(errorMap.get(i)) });
     } else {
-      let resp = responses[ rIdx++ ];
-      if (!resp) {
+      const fetchPos = fetchIndices.indexOf(i);
+      if (fetchPos === -1 || !responses[ fetchPos ]) {
         results.push({ e: "fetch failed" });
       } else {
+        const resp = responses[ fetchPos ];
         results.push({
           s: resp.getResponseCode(),
           h: _respHeaders(resp),
