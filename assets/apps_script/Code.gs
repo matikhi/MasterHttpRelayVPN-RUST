@@ -7,18 +7,18 @@
  *  Uses UrlFetchApp.fetchAll() — all URLs fetched IN PARALLEL.
  *
  * DEPLOYMENT:
- *   1. Go to https://script.google.com → New project
- *   2. Delete the default code, paste THIS entire file
- *   3. Change AUTH_KEY below to your own secret
- *   4. (Optional) Set CACHE_SPREADSHEET_ID to enable caching
- *   5. Click Deploy → New deployment
- *   6. Type: Web app  |  Execute as: Me  |  Who has access: Anyone
- *   7. Copy the Deployment ID into config.toml as "script_id"
+ *  1. Go to script.google.com → New project
+ *  2. Delete the default code, paste THIS entire file
+ *  3. Open Project Settings (⚙️ icon) > Script Properties
+ *  4. Add key-value pair: AUTH_KEY = <your_key_value>
+ *  5. Click Deploy → New deployment
+ *  6. Type: Web app | Execute as: Me | Who has access: Anyone
+ *  7. Copy the Deployment ID into config.toml (previous config.json) as "script_id"
  *
- * CHANGE THE AUTH KEY BELOW TO YOUR OWN SECRET!
  */
+const PROPERTIES = PropertiesService.getScriptProperties();
 
-const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
+const AUTH_KEY = PROPERTIES.getProperty("AUTH_KEY");
 
 // Active-probing defense. When false (production default), bad AUTH_KEY
 // requests get a decoy HTML page that looks like a placeholder Apps
@@ -64,14 +64,14 @@ const DECOY_HTML =
 
 // ── Request Handlers ────────────────────────────────────────
 
-function _decoyOrError(jsonBody) {
+function _decoyOrError (jsonBody) {
   if (DIAGNOSTIC_MODE) return _json(jsonBody);
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.HTML);
 }
 
-function doPost(e) {
+function doPost (e) {
   try {
     var req = JSON.parse(e.postData.contents);
     if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
@@ -93,7 +93,7 @@ function doPost(e) {
 // here which is a fine-enough decoy on its own, but explicitly returning
 // the same harmless placeholder makes the response identical to the
 // bad-auth POST decoy — one less fingerprint vector.
-function doGet(e) {
+function doGet (e) {
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.HTML);
@@ -101,7 +101,7 @@ function doGet(e) {
 
 // ── Single Request ─────────────────────────────────────────
 
-function _doSingle(req) {
+function _doSingle (req) {
   if (!req.u || typeof req.u !== "string" || !req.u.match(/^https?:\/\//i)) {
     return _json({ e: "bad url" });
   }
@@ -133,20 +133,20 @@ function _doSingle(req) {
 
 // ── Batch Request ──────────────────────────────────────────
 
-function _doBatch(items) {
+function _doBatch (items) {
   var fetchArgs = [];
   var fetchIndex = [];
   var fetchMethods = [];
   var errorMap = {};
 
   for (var i = 0; i < items.length; i++) {
-    var item = items[i];
+    var item = items[ i ];
     if (!item || typeof item !== "object") {
-      errorMap[i] = "bad item";
+      errorMap[ i ] = "bad item";
       continue;
     }
     if (!item.u || typeof item.u !== "string" || !item.u.match(/^https?:\/\//i)) {
-      errorMap[i] = "bad url";
+      errorMap[ i ] = "bad url";
       continue;
     }
     try {
@@ -156,7 +156,7 @@ function _doBatch(items) {
       fetchIndex.push(i);
       fetchMethods.push(String(item.m || "GET").toUpperCase());
     } catch (buildErr) {
-      errorMap[i] = String(buildErr);
+      errorMap[ i ] = String(buildErr);
     }
   }
 
@@ -173,13 +173,13 @@ function _doBatch(items) {
       responses = [];
       for (var j = 0; j < fetchArgs.length; j++) {
         try {
-          if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
-            errorMap[fetchIndex[j]] =
+          if (!SAFE_REPLAY_METHODS[ fetchMethods[ j ] ]) {
+            errorMap[ fetchIndex[ j ] ] =
               "batch fetchAll failed; unsafe method not replayed";
-            responses[j] = null;
+            responses[ j ] = null;
             continue;
           }
-          var fallbackReq = fetchArgs[j];
+          var fallbackReq = fetchArgs[ j ];
           var fallbackUrl = fallbackReq.url;
           var fallbackOpts = {};
           for (var key in fallbackReq) {
@@ -187,13 +187,13 @@ function _doBatch(items) {
               Object.prototype.hasOwnProperty.call(fallbackReq, key) &&
               key !== "url"
             ) {
-              fallbackOpts[key] = fallbackReq[key];
+              fallbackOpts[ key ] = fallbackReq[ key ];
             }
           }
-          responses[j] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
+          responses[ j ] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
         } catch (singleErr) {
-          errorMap[fetchIndex[j]] = String(singleErr);
-          responses[j] = null;
+          errorMap[ fetchIndex[ j ] ] = String(singleErr);
+          responses[ j ] = null;
         }
       }
     }
@@ -203,9 +203,9 @@ function _doBatch(items) {
   var rIdx = 0;
   for (var i = 0; i < items.length; i++) {
     if (Object.prototype.hasOwnProperty.call(errorMap, i)) {
-      results.push({ e: errorMap[i] });
+      results.push({ e: errorMap[ i ] });
     } else {
-      var resp = responses[rIdx++];
+      var resp = responses[ rIdx++ ];
       if (!resp) {
         results.push({ e: "fetch failed" });
       } else {
@@ -222,7 +222,7 @@ function _doBatch(items) {
 
 // ── Request Building ───────────────────────────────────────
 
-function _buildOpts(req) {
+function _buildOpts (req) {
   var opts = {
     method: (req.m || "GET").toLowerCase(),
     muteHttpExceptions: true,
@@ -233,8 +233,8 @@ function _buildOpts(req) {
   if (req.h && typeof req.h === "object") {
     var headers = {};
     for (var k in req.h) {
-      if (req.h.hasOwnProperty(k) && !SKIP_HEADERS[k.toLowerCase()]) {
-        headers[k] = req.h[k];
+      if (req.h.hasOwnProperty(k) && !SKIP_HEADERS[ k.toLowerCase() ]) {
+        headers[ k ] = req.h[ k ];
       }
     }
     opts.headers = headers;
@@ -246,16 +246,16 @@ function _buildOpts(req) {
   return opts;
 }
 
-function _respHeaders(resp) {
+function _respHeaders (resp) {
   try {
     if (typeof resp.getAllHeaders === "function") {
       return resp.getAllHeaders();
     }
-  } catch (err) {}
+  } catch (err) { }
   return resp.getHeaders();
 }
 
-function _json(obj) {
+function _json (obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
     ContentService.MimeType.JSON
   );
