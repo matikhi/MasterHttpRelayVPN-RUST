@@ -75,14 +75,14 @@ function doGet (e) {
     .setMimeType(ContentService.MimeType.XML);
 }
 
-function _json (obj) {
+function _relayResponse (obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
     ContentService.MimeType.JSON
   );
 }
 
-function _decoyOrError (jsonBody) {
-  if (DIAGNOSTIC_MODE) return _json(jsonBody);
+function _decoyOrError (err) {
+  if (DIAGNOSTIC_MODE) return _relayResponse(err);
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.XML);
@@ -93,8 +93,14 @@ function _respHeaders (resp) {
 }
 
 function _buildOpts (req) {
+  const method = (req.m?.toLowerCase?.() ?? "get");
+
+  if (!VALID_METHODS.has(method)) {
+    throw new Error(`Invalid HTTP method: ${ method }`);
+  }
+
   let opts = {
-    method: (req.m?.toLowerCase?.() ?? "get"),
+    method: method,
     muteHttpExceptions: true,
     followRedirects: true,          // ← always true; r flag now has different meaning
     validateHttpsCertificates: true,
@@ -106,15 +112,37 @@ function _buildOpts (req) {
       Object.entries(req.h).filter(([ k ]) => !SKIP_HEADERS.has(k.toLowerCase())));
   }
   if (req.b) {
-    opts.payload = Utilities.base64Decode(req.b);
+    if (typeof req.b !== "string") {
+      throw new Error("Payload must be string (base64)");
+    }
+    if (req.b.length > 50000000) {
+      throw new Error("Payload exceeds 50MB limit");
+    }
+    try {
+      opts.payload = Utilities.base64Decode(req.b);
+    } catch (decodeErr) {
+      throw new Error(`Base64 decode failed: ${ String(decodeErr) }`);
+    }
     if (req.ct) opts.contentType = req.ct;
   }
   return opts;
 }
 
+function _buildResponse (resp) {
+  let respContent = resp.getContent();
+  if (respContent && respContent.length > 50000000) {
+    throw new Error("Payload exceeds 50MB limit");
+  }
+  return {
+    s: resp.getResponseCode(),
+    h: _respHeaders(resp),
+    b: Utilities.base64Encode(respContent),
+  };
+}
+
 function _doSingle (req) {
   if (!req.u || typeof req.u !== "string" || !URL_PATTERN.test(req.u)) {
-    return _json({ e: "bad url" });
+    return _relayResponse({ e: "bad url" });
   }
 
   // ── Normal relay ────────
@@ -148,13 +176,9 @@ function _doSingle (req) {
       }
     }
 
-    return _json({
-      s: resp.getResponseCode(),
-      h: _respHeaders(resp),
-      b: Utilities.base64Encode(resp.getContent()),
-    });
+    return _relayResponse(_buildResponse(resp));
   } catch (err) {
-    return _json({ e: "fetch failed: " + String(err) });
+    return _relayResponse({ e: "fetch failed: " + String(err) });
   }
 }
 
@@ -225,27 +249,32 @@ function _doBatch (items) {
       if (fetchPos === -1 || !responses[ fetchPos ]) {
         results.push({ e: "fetch failed" });
       } else {
-        const resp = responses[ fetchPos ];
-        results.push({
-          s: resp.getResponseCode(),
-          h: _respHeaders(resp),
-          b: Utilities.base64Encode(resp.getContent()),
-        });
+        try {
+          results.push(_buildResponse(responses[ fetchPos ]));
+        } catch (err) {
+          results.push({ e: `fetch failed: ${ String(err) }` });
+        }
       }
     }
   }
-  return _json({ q: results });
+  return _relayResponse({ q: results });
 }
 
 function doPost (e) {
+  if (!AUTH_KEY) {
+    Logger.log("[ERROR] doPost: AUTH_KEY not configured");
+    return _decoyOrError({ e: "AUTH_KEY not configured" });
+  }
   try {
     let req = JSON.parse(e.postData.contents);
     if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
 
     // Batch mode: { k, q: [...] }
-    if (Array.isArray(req.q)) return _doBatch(req.q);
-
-    // Single mode
+    if ("q" in req) {
+      if (req.q.length === 0) return _relayResponse({ q: [] });
+      return _doBatch(req.q);
+    }
+    // Single mode: { k, m, u, h, b, ct, r }
     return _doSingle(req);
   } catch (err) {
     // Parse failures of the request body are also probe-shaped — a real
