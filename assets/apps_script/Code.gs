@@ -68,12 +68,12 @@ function _decoyOrError (jsonBody) {
   if (DIAGNOSTIC_MODE) return _json(jsonBody);
   return ContentService
     .createTextOutput(DECOY_HTML)
-    .setMimeType(ContentService.MimeType.HTML);
+    .setMimeType(ContentService.MimeType.XML);
 }
 
 function doPost (e) {
   try {
-    var req = JSON.parse(e.postData.contents);
+    let req = JSON.parse(e.postData.contents);
     if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
 
     // Batch mode: { k, q: [...] }
@@ -96,7 +96,7 @@ function doPost (e) {
 function doGet (e) {
   return ContentService
     .createTextOutput(DECOY_HTML)
-    .setMimeType(ContentService.MimeType.HTML);
+    .setMimeType(ContentService.MimeType.XML);
 }
 
 // ── Single Request ─────────────────────────────────────────
@@ -118,8 +118,25 @@ function _doSingle (req) {
   // and the user has no signal as to the actual cause. Mirrors the
   // per-item try/catch in _doBatch below.
   try {
-    var opts = _buildOpts(req);
-    var resp = UrlFetchApp.fetch(req.u, opts);
+    let opts = _buildOpts(req);
+    let resp = UrlFetchApp.fetch(req.u, opts);
+
+    // Raw-return mode for exit-node path.
+    // r:true = return destination body verbatim so Rust gets {s,h,b} unwrapped.
+    if (req.r === true) {
+      try {
+        let respContent = resp.getContentText();
+        /** @type {Object} */
+        let respObj = JSON.parse(respContent);
+        if ([ "s", "h", "b" ].every(prop => respObj.hasOwnProperty(prop)))
+          return ContentService
+            .createTextOutput(respContent)
+            .setMimeType(ContentService.MimeType.JSON);
+      } catch {
+        // exit-node format not matched, continuing normal relay
+      }
+    }
+
 
     return _json({
       s: resp.getResponseCode(),
@@ -134,13 +151,13 @@ function _doSingle (req) {
 // ── Batch Request ──────────────────────────────────────────
 
 function _doBatch (items) {
-  var fetchArgs = [];
-  var fetchIndex = [];
-  var fetchMethods = [];
-  var errorMap = {};
+  let fetchArgs = [];
+  let fetchIndex = [];
+  let fetchMethods = [];
+  let errorMap = {};
 
-  for (var i = 0; i < items.length; i++) {
-    var item = items[ i ];
+  for (let i = 0; i < items.length; i++) {
+    let item = items[ i ];
     if (!item || typeof item !== "object") {
       errorMap[ i ] = "bad item";
       continue;
@@ -150,7 +167,7 @@ function _doBatch (items) {
       continue;
     }
     try {
-      var opts = _buildOpts(item);
+      let opts = _buildOpts(item);
       opts.url = item.u;
       fetchArgs.push(opts);
       fetchIndex.push(i);
@@ -165,13 +182,13 @@ function _doBatch (items) {
   // poisons the whole batch), degrade to per-item fetch on safe methods
   // so a single bad request does not zero out every response in the
   // batch. Mirrors upstream `masterking32/MasterHttpRelayVPN@3094288`.
-  var responses = [];
+  let responses = [];
   if (fetchArgs.length > 0) {
     try {
       responses = UrlFetchApp.fetchAll(fetchArgs);
     } catch (fetchAllErr) {
       responses = [];
-      for (var j = 0; j < fetchArgs.length; j++) {
+      for (let j = 0; j < fetchArgs.length; j++) {
         try {
           if (!SAFE_REPLAY_METHODS[ fetchMethods[ j ] ]) {
             errorMap[ fetchIndex[ j ] ] =
@@ -179,10 +196,10 @@ function _doBatch (items) {
             responses[ j ] = null;
             continue;
           }
-          var fallbackReq = fetchArgs[ j ];
-          var fallbackUrl = fallbackReq.url;
-          var fallbackOpts = {};
-          for (var key in fallbackReq) {
+          let fallbackReq = fetchArgs[ j ];
+          let fallbackUrl = fallbackReq.url;
+          let fallbackOpts = {};
+          for (let key in fallbackReq) {
             if (
               Object.prototype.hasOwnProperty.call(fallbackReq, key) &&
               key !== "url"
@@ -199,13 +216,13 @@ function _doBatch (items) {
     }
   }
 
-  var results = [];
-  var rIdx = 0;
-  for (var i = 0; i < items.length; i++) {
+  let results = [];
+  let rIdx = 0;
+  for (let i = 0; i < items.length; i++) {
     if (Object.prototype.hasOwnProperty.call(errorMap, i)) {
       results.push({ e: errorMap[ i ] });
     } else {
-      var resp = responses[ rIdx++ ];
+      let resp = responses[ rIdx++ ];
       if (!resp) {
         results.push({ e: "fetch failed" });
       } else {
@@ -223,16 +240,16 @@ function _doBatch (items) {
 // ── Request Building ───────────────────────────────────────
 
 function _buildOpts (req) {
-  var opts = {
+  let opts = {
     method: (req.m || "GET").toLowerCase(),
     muteHttpExceptions: true,
-    followRedirects: req.r !== false,
+    followRedirects: true,          // ← always true; r flag now has different meaning
     validateHttpsCertificates: true,
     escaping: false,
   };
   if (req.h && typeof req.h === "object") {
-    var headers = {};
-    for (var k in req.h) {
+    let headers = {};
+    for (let k in req.h) {
       if (req.h.hasOwnProperty(k) && !SKIP_HEADERS[ k.toLowerCase() ]) {
         headers[ k ] = req.h[ k ];
       }
