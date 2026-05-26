@@ -254,15 +254,56 @@ function _doSingle (req) {
 }
 
 /**
+ * Helper to process a batch of 50 requests
+ * @param { Array<GoogleAppsScript.URL_Fetch.URLFetchRequest>} fetchBatch
+ * @param { Array<number>} batchIndices
+ * @param { Map<number, RequestMapData>} requestMap
+ * @param { Map<number, Object> } errorMap
+ */
+function _processBatch (fetchBatch, batchIndices, requestMap, errorMap) {
+  try {
+    const responses = UrlFetchApp.fetchAll(fetchBatch);
+    for (let j = 0; j < responses.length; j++) {
+      const originalIndex = batchIndices[ j ];
+      requestMap.get(originalIndex).response = responses[ j ];
+    }
+  } catch (fetchAllErr) {
+    const fetchAllErrMsg = String(fetchAllErr);
+    Logger.log(`[WARN] fetchAll failed, retrying: ${ fetchAllErrMsg }`);
+
+    // Fallback: retry safe methods individually
+    for (let j = 0; j < fetchBatch.length; j++) {
+      const originalIndex = batchIndices[ j ];
+      const reqObj = requestMap.get(originalIndex);
+
+      if (!SAFE_REPLAY_METHODS.has(reqObj.method)) {
+        errorMap.set(originalIndex, "batch fetchAll failed; unsafe method not replayed");
+        continue;
+      }
+
+      try {
+        const resp = UrlFetchApp.fetch(reqObj.request.url, reqObj.request);
+        reqObj.response = resp;
+      } catch (singleErr) {
+        const singleErrMsg = String(singleErr);
+        Logger.log(`[ERROR] _doBatch fallback[${ originalIndex }]: ${ singleErrMsg }`);
+        errorMap.set(originalIndex, singleErrMsg);
+      }
+    }
+  }
+}
+
+/**
  * @param {Array<ClientRequest>} items
  * @returns {GoogleAppsScript.Content.TextOutput}
 */
 function _doBatch (items) {
-  let fetchItems = [];
-  let fetchIndices = [];
-  let fetchMethods = [];
+  /** @type {Map<number, {request: Object, method: string, response: GoogleAppsScript.URL_Fetch.HTTPResponse | null}>} */
+  let requestMap = new Map();
+  /** @type {Map<number, string>} */
   let errorMap = new Map();
 
+  // Build request map
   for (let i = 0; i < items.length; i++) {
     let item = items[ i ];
     if (!item || typeof item !== "object") {
@@ -276,9 +317,9 @@ function _doBatch (items) {
       continue;
     }
     try {
-      fetchItems.push({ url: item.u, ..._buildOpts(item) });
-      fetchIndices.push(i);
-      fetchMethods.push((item.m?.toLowerCase?.() ?? "get"));
+      const method = (item.m?.toLowerCase?.() ?? "get");
+      const request = { url: item.u, ..._buildOpts(item) };
+      requestMap.set(i, { request, method, response: null });
     } catch (buildErr) {
       const errMsg = String(buildErr);
       Logger.log(`[ERROR] _doBatch[${ i }] _buildOpts: ${ errMsg }`);
@@ -286,60 +327,68 @@ function _doBatch (items) {
     }
   }
 
-  // fetchAll() processes all requests in parallel inside Google. If it
-  // throws as a whole (e.g. one URL violates UrlFetchApp limits and
-  // poisons the whole batch), degrade to per-item fetch on safe methods
-  // so a single bad request does not zero out every response in the
-  // batch. Mirrors upstream `masterking32/MasterHttpRelayVPN@3094288`.
-  let responses = [];
-  try {
-    // Single - chunk fast path; avoids the fetchAll overhead for the common case.
-    if (fetchItems.length === 1) {
-      responses = [ UrlFetchApp.fetch(fetchItems[ 0 ].url, fetchItems[ 0 ]) ];
-    } else {
-      responses = UrlFetchApp.fetchAll(fetchItems);
+  if (requestMap.size === 0) {
+    // All items failed validation
+    let results = [];
+    for (let i = 0; i < items.length; i++) {
+      results.push({ e: String(errorMap.get(i)) });
     }
-  } catch (fetchAllErr) {
-    const fetchAllErrMsg = String(fetchAllErr);
-    responses = [];
-    for (let j = 0; j < fetchItems.length; j++) {
-      try {
-        if (!SAFE_REPLAY_METHODS.has(fetchMethods[ j ])) {
-          errorMap.set(fetchIndices[ j ], "batch fetchAll failed; unsafe method not replayed");
-          responses[ j ] = null;
-          continue;
-        }
-        let fallbackReq = fetchItems[ j ];
-        responses[ j ] = UrlFetchApp.fetch(fallbackReq.url, fallbackReq);
-      } catch (singleErr) {
-        const singleErrMsg = String(singleErr);
-        Logger.log(`[ERROR] _doBatch (fetching single item): ${ fetchIndices[ j ] }`);
-        errorMap.set(fetchIndices[ j ], singleErrMsg);
-        responses[ j ] = null;
+    return _relayResponse({ q: results });
+  }
+
+  // Single-item fast path
+  if (requestMap.size === 1) {
+    const [ originalIndex, data ] = requestMap.entries().next().value;
+    try {
+      const resp = UrlFetchApp.fetch(data.request.url, data.request);
+      data.response = resp;
+    } catch (singleErr) {
+      const singleErrMsg = String(singleErr);
+      Logger.log(`[ERROR] _doBatch (fetching single item): ${ singleErrMsg }`);
+      errorMap.set(originalIndex, singleErrMsg);
+    }
+
+  } else {
+    // Batch mode
+    let requestCount = 0;
+    let fetchBatch = [];
+    let batchIndices = [];
+
+    for (const [ originalIndex, data ] of requestMap) {
+      fetchBatch.push(data.request);
+      batchIndices.push(originalIndex);
+      requestCount++;
+
+      // Process batch when it reaches 50 or we're at the end
+      if (fetchBatch.length === 50 || requestCount === requestMap.size) {
+        _processBatch(fetchBatch, batchIndices, requestMap, errorMap);
+        fetchBatch = [];
+        batchIndices = [];
       }
     }
   }
 
+  // Build results
+  /** @type {Array<RelaySingleResponse | RelayErrorResponse>} */
   let results = [];
   for (let i = 0; i < items.length; i++) {
     if (errorMap.has(i)) {
       results.push({ e: String(errorMap.get(i)) });
-    } else {
-      const fetchPos = fetchIndices.indexOf(i);
-      if (fetchPos === -1 || !responses[ fetchPos ]) {
-        results.push({ e: "fetch failed" });
-      } else {
-        try {
-          results.push(_buildResponse(responses[ fetchPos ]));
-        } catch (err) {
-          results.push({ e: `fetch failed: ${ String(err) }` });
-        }
+    } else if (requestMap.has(i) && requestMap.get(i).response) {
+      try {
+        results.push(_buildResponse(requestMap.get(i).response));
+      } catch (err) {
+        results.push({ e: `fetch failed: ${ String(err) }` });
       }
+    } else {
+      results.push({ e: "fetch failed" });
     }
   }
+
   return _relayResponse({ q: results });
 }
 
+/** @param {GoogleAppsScript.Events.DoPost} e */
 function doPost (e) {
   if (!AUTH_KEY) {
     Logger.log("[ERROR] doPost: AUTH_KEY not configured");
