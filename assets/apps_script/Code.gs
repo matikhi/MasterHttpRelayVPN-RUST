@@ -64,23 +64,72 @@ const DECOY_HTML =
 
 const URL_PATTERN = /^https?:\/\//i;
 
-// `doGet` is what active scanners hit first (HTTP GET probes are cheaper
-// than POSTs). Apps Script defaults to a "Script function not found" page
-// here which is a fine-enough decoy on its own, but explicitly returning
-// the same harmless placeholder makes the response identical to the
-// bad-auth POST decoy — one less fingerprint vector.
+/**
+ * @typedef {Object} ClientRequest
+ * @property {GoogleAppsScript.URL_Fetch.HttpMethod} m
+ * @property {string} u - URL to relay
+ * @property {GoogleAppsScript.URL_Fetch.HttpHeaders} h
+ * @property {string} b  - Request body
+ * @property {string} ct - Request contentType
+ * @property {boolean} r - Request goes through exit node
+ */
+
+/**
+ * @typedef {Object} ClientRequestSingle
+ * @property {string} k - Auth token
+ * @property {GoogleAppsScript.URL_Fetch.HttpMethod} m
+ * @property {string} u - URL to relay
+ * @property {GoogleAppsScript.URL_Fetch.HttpHeaders} h
+ * @property {string} b  - Request body
+ * @property {string} ct - Request contentType
+ * @property {boolean} r - Request goes through exit node
+ */
+
+/**
+ * @typedef {Object} ClientRequestBatch
+ * @property {string} k
+ * @property {Array<ClientRequest>} q
+ */
+
+/**
+ * @typedef RelayErrorResponse
+ * @property {string} e
+ */
+
+/**
+ * @typedef RelaySingleResponse
+ * @property {number} s
+ * @property {GoogleAppsScript.URL_Fetch.HttpHeaders} h
+ * @property {string} b
+*/
+
+/**
+ * @typedef RelayBatchResponse
+ * @property {Array<RelaySingleResponse | RelayErrorResponse>} q
+ */
+
+/**
+ * `doGet` is what active scanners hit first (HTTP GET probes are cheaper
+ * than POSTs). Apps Script defaults to a "Script function not found" page
+ * here which is a fine-enough decoy on its own, but explicitly returning
+ * the same harmless placeholder makes the response identical to the
+ * bad-auth POST decoy — one less fingerprint vector.
+ * @param {GoogleAppsScript.Events.DoGet} e
+*/
 function doGet (e) {
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.XML);
 }
 
+/** @param {RelayErrorResponse | RelaySingleResponse | RelayBatchResponse} obj  */
 function _relayResponse (obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
     ContentService.MimeType.JSON
   );
 }
 
+/** @param {RelayErrorResponse} err  */
 function _decoyOrError (err) {
   if (DIAGNOSTIC_MODE) return _relayResponse(err);
   return ContentService
@@ -88,10 +137,12 @@ function _decoyOrError (err) {
     .setMimeType(ContentService.MimeType.XML);
 }
 
+/** @param {GoogleAppsScript.URL_Fetch.HTTPResponse} resp  */
 function _respHeaders (resp) {
   return resp.getAllHeaders?.() ?? resp.getHeaders();
 }
 
+/** @param {ClientRequest} req  */
 function _buildOpts (req) {
   const method = (req.m?.toLowerCase?.() ?? "get");
 
@@ -99,7 +150,9 @@ function _buildOpts (req) {
     throw new Error(`Invalid HTTP method: ${ method }`);
   }
 
+  /** @type {GoogleAppsScript.URL_Fetch.URLFetchRequestOptions} */
   let opts = {
+    /** @type {GoogleAppsScript.URL_Fetch.HttpMethod} */
     method: method,
     muteHttpExceptions: true,
     followRedirects: true,          // ← always true; r flag now has different meaning
@@ -115,11 +168,12 @@ function _buildOpts (req) {
     if (typeof req.b !== "string") {
       throw new Error("Payload must be string (base64)");
     }
-    if (req.b.length > 50000000) {
-      throw new Error("Payload exceeds 50MB limit");
-    }
     try {
-      opts.payload = Utilities.base64Decode(req.b);
+      const decoded = Utilities.base64Decode(req.b);
+      if (decoded.length > 50000000) {
+        throw new Error("Payload exceeds 50MB limit");
+      }
+      opts.payload = decoded;
     } catch (decodeErr) {
       throw new Error(`Base64 decode failed: ${ String(decodeErr) }`);
     }
@@ -128,22 +182,37 @@ function _buildOpts (req) {
   return opts;
 }
 
+/**
+ * @param {GoogleAppsScript.URL_Fetch.HTTPResponse} resp
+ * @return {RelaySingleResponse}
+*/
 function _buildResponse (resp) {
-  let respContent = resp.getContent();
-  if (respContent && respContent.length > 50000000) {
-    throw new Error("Payload exceeds 50MB limit");
+  try {
+    let respContentB64 = Utilities.base64Encode(resp.getContent());
+    if (respContentB64.length > 50000000) {
+      throw new Error("Payload exceeds 50MB limit");
+    }
+    return {
+      s: resp.getResponseCode(),
+      h: _respHeaders(resp),
+      b: respContentB64,
+    };
+  } catch (encodeErr) {
+    throw new Error(`Base64 encode failed: ${ String(encodeErr) }`);
   }
-  return {
-    s: resp.getResponseCode(),
-    h: _respHeaders(resp),
-    b: Utilities.base64Encode(respContent),
-  };
 }
 
+/**
+ * @param {ClientRequestSingle} req
+ * @return {GoogleAppsScript.Content.TextOutput}
+*/
 function _doSingle (req) {
   if (!req.u || typeof req.u !== "string" || !URL_PATTERN.test(req.u)) {
-    return _relayResponse({ e: "bad url" });
+    const errMsg = "invalid url: " + String(req.u);
+    Logger.log(`[ERROR] _doSingle: ${ errMsg }`);
+    return _relayResponse({ e: errMsg });
   }
+
 
   // ── Normal relay ────────
   // Wrap the fetch + body encode in try/catch so any failure surfaces as
@@ -178,10 +247,16 @@ function _doSingle (req) {
 
     return _relayResponse(_buildResponse(resp));
   } catch (err) {
-    return _relayResponse({ e: "fetch failed: " + String(err) });
+    const errMsg = `fetch failed: ${ String(err) }`;
+    Logger.log(`[ERROR] _doSingle(${ req.u }): ${ errMsg }`);
+    return _relayResponse({ e: errMsg });
   }
 }
 
+/**
+ * @param {Array<ClientRequest>} items
+ * @returns {GoogleAppsScript.Content.TextOutput}
+*/
 function _doBatch (items) {
   let fetchItems = [];
   let fetchIndices = [];
@@ -195,7 +270,9 @@ function _doBatch (items) {
       continue;
     }
     if (!item.u || typeof item.u !== "string" || !URL_PATTERN.test(item.u)) {
-      errorMap.set(i, "bad url");
+      const errMsg = `bad url: ${ String(item.u) }`;
+      Logger.log(`[ERROR] _doBatch[${ i }]: ${ errMsg }`);
+      errorMap.set(i, errMsg);
       continue;
     }
     try {
@@ -203,7 +280,9 @@ function _doBatch (items) {
       fetchIndices.push(i);
       fetchMethods.push((item.m?.toLowerCase?.() ?? "get"));
     } catch (buildErr) {
-      errorMap.set(i, String(buildErr));
+      const errMsg = String(buildErr);
+      Logger.log(`[ERROR] _doBatch[${ i }] _buildOpts: ${ errMsg }`);
+      errorMap.set(i, errMsg);
     }
   }
 
@@ -234,6 +313,7 @@ function _doBatch (items) {
         responses[ j ] = UrlFetchApp.fetch(fallbackReq.url, fallbackReq);
       } catch (singleErr) {
         const singleErrMsg = String(singleErr);
+        Logger.log(`[ERROR] _doBatch (fetching single item): ${ fetchIndices[ j ] }`);
         errorMap.set(fetchIndices[ j ], singleErrMsg);
         responses[ j ] = null;
       }
@@ -266,8 +346,12 @@ function doPost (e) {
     return _decoyOrError({ e: "AUTH_KEY not configured" });
   }
   try {
+    /** @type {ClientRequestSingle | ClientRequestBatch} **/
     let req = JSON.parse(e.postData.contents);
-    if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
+    if (req.k !== AUTH_KEY) {
+      Logger.log("[WARN] doPost: unauthorized attempt");
+      return _decoyOrError({ e: "unauthorized" });
+    }
 
     // Batch mode: { k, q: [...] }
     if ("q" in req) {
@@ -279,6 +363,9 @@ function doPost (e) {
   } catch (err) {
     // Parse failures of the request body are also probe-shaped — a real
     // mhrv-rs client never sends invalid JSON. Decoy for the same reason.
-    return _decoyOrError({ e: String(err) });
+
+    const errMsg = String(err);
+    Logger.log(`[ERROR] doPost parse: ${ errMsg }`);
+    return _decoyOrError({ e: errMsg });
   }
 }
